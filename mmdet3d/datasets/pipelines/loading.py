@@ -1,6 +1,7 @@
 import mmcv
 import numpy as np
 
+from mmdet3d.core.points import BasePoints, get_points_type
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import LoadAnnotations
 
@@ -71,21 +72,37 @@ class LoadPointsFromMultiSweeps(object):
     This is usually used for nuScenes dataset to utilize previous sweeps.
 
     Args:
-        sweeps_num (int): number of sweeps. Defaults to 10.
-        load_dim (int): dimension number of the loaded points. Defaults to 5.
+        sweeps_num (int): Number of sweeps. Defaults to 10.
+        load_dim (int): Dimension number of the loaded points. Defaults to 5.
+        use_dim (list[int]): Which dimension to use. Defaults to [0, 1, 2, 4].
         file_client_args (dict): Config dict of file clients, refer to
             https://github.com/open-mmlab/mmcv/blob/master/mmcv/fileio/file_client.py
             for more details. Defaults to dict(backend='disk').
+        pad_empty_sweeps (bool): Whether to repeat keyframe when
+            sweeps is empty. Defaults to False.
+        remove_close (bool): Whether to remove close points.
+            Defaults to False.
+        test_mode (bool): If test_model=True used for testing, it will not
+            randomly sample sweeps but select the nearest N frames.
+            Defaults to False.
     """
 
     def __init__(self,
                  sweeps_num=10,
                  load_dim=5,
-                 file_client_args=dict(backend='disk')):
+                 use_dim=[0, 1, 2, 4],
+                 file_client_args=dict(backend='disk'),
+                 pad_empty_sweeps=False,
+                 remove_close=False,
+                 test_mode=False):
         self.load_dim = load_dim
         self.sweeps_num = sweeps_num
+        self.use_dim = use_dim
         self.file_client_args = file_client_args.copy()
         self.file_client = None
+        self.pad_empty_sweeps = pad_empty_sweeps
+        self.remove_close = remove_close
+        self.test_mode = test_mode
 
     def _load_points(self, pts_filename):
         """Private function to load point clouds data.
@@ -109,6 +126,28 @@ class LoadPointsFromMultiSweeps(object):
                 points = np.fromfile(pts_filename, dtype=np.float32)
         return points
 
+    def _remove_close(self, points, radius=1.0):
+        """Removes point too close within a certain radius from origin.
+
+        Args:
+            points (np.ndarray): Sweep points.
+            radius (float): Radius below which points are removed.
+                Defaults to 1.0.
+
+        Returns:
+            np.ndarray: Points after removing.
+        """
+        if isinstance(points, np.ndarray):
+            points_numpy = points
+        elif isinstance(points, BasePoints):
+            points_numpy = points.tensor.numpy()
+        else:
+            raise NotImplementedError
+        x_filt = np.abs(points_numpy[:, 0]) < radius
+        y_filt = np.abs(points_numpy[:, 1]) < radius
+        not_close = np.logical_not(np.logical_and(x_filt, y_filt))
+        return points[not_close]
+
     def __call__(self, results):
         """Call function to load multi-sweep point clouds from files.
 
@@ -123,25 +162,39 @@ class LoadPointsFromMultiSweeps(object):
                 - points (np.ndarray): Multi-sweep point cloud arrays.
         """
         points = results['points']
-        points[:, 3] /= 255
-        points[:, 4] = 0
+        points.tensor[:, 4] = 0
         sweep_points_list = [points]
         ts = results['timestamp']
+        if self.pad_empty_sweeps and len(results['sweeps']) == 0:
+            for i in range(self.sweeps_num):
+                if self.remove_close:
+                    sweep_points_list.append(self._remove_close(points))
+                else:
+                    sweep_points_list.append(points)
+        else:
+            if len(results['sweeps']) <= self.sweeps_num:
+                choices = np.arange(len(results['sweeps']))
+            elif self.test_mode:
+                choices = np.arange(self.sweeps_num)
+            else:
+                choices = np.random.choice(
+                    len(results['sweeps']), self.sweeps_num, replace=False)
+            for idx in choices:
+                sweep = results['sweeps'][idx]
+                points_sweep = self._load_points(sweep['data_path'])
+                points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
+                if self.remove_close:
+                    points_sweep = self._remove_close(points_sweep)
+                sweep_ts = sweep['timestamp'] / 1e6
+                points_sweep[:, :3] = points_sweep[:, :3] @ sweep[
+                    'sensor2lidar_rotation'].T
+                points_sweep[:, :3] += sweep['sensor2lidar_translation']
+                points_sweep[:, 4] = ts - sweep_ts
+                points_sweep = points.new_point(points_sweep)
+                sweep_points_list.append(points_sweep)
 
-        for idx, sweep in enumerate(results['sweeps']):
-            if idx >= self.sweeps_num:
-                break
-            points_sweep = self._load_points(sweep['data_path'])
-            points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
-            sweep_ts = sweep['timestamp'] / 1e6
-            points_sweep[:, 3] /= 255
-            points_sweep[:, :3] = points_sweep[:, :3] @ sweep[
-                'sensor2lidar_rotation'].T
-            points_sweep[:, :3] += sweep['sensor2lidar_translation']
-            points_sweep[:, 4] = ts - sweep_ts
-            sweep_points_list.append(points_sweep)
-
-        points = np.concatenate(sweep_points_list, axis=0)[:, [0, 1, 2, 4]]
+        points = points.cat(sweep_points_list)
+        points = points[:, self.use_dim]
         results['points'] = points
         return results
 
@@ -243,6 +296,11 @@ class LoadPointsFromFile(object):
     Args:
         load_dim (int): The dimension of the loaded points.
             Defaults to 6.
+        coord_type (str): The type of coordinates of points cloud.
+            Available options includes:
+            - 'LIDAR': Points in LiDAR coordinates.
+            - 'DEPTH': Points in depth coordinates, usually for indoor dataset.
+            - 'CAMERA': Points in camera coordinates.
         use_dim (list[int]): Which dimensions of the points to be used.
             Defaults to [0, 1, 2]. For KITTI dataset, set use_dim=4
             or use_dim=[0, 1, 2, 3] to use the intensity dimension.
@@ -253,6 +311,7 @@ class LoadPointsFromFile(object):
     """
 
     def __init__(self,
+                 coord_type,
                  load_dim=6,
                  use_dim=[0, 1, 2],
                  shift_height=False,
@@ -262,7 +321,9 @@ class LoadPointsFromFile(object):
             use_dim = list(range(use_dim))
         assert max(use_dim) < load_dim, \
             f'Expect all used dimensions < {load_dim}, got {use_dim}'
+        assert coord_type in ['CAMERA', 'LIDAR', 'DEPTH']
 
+        self.coord_type = coord_type
         self.load_dim = load_dim
         self.use_dim = use_dim
         self.file_client_args = file_client_args.copy()
@@ -288,6 +349,7 @@ class LoadPointsFromFile(object):
                 points = np.load(pts_filename)
             else:
                 points = np.fromfile(pts_filename, dtype=np.float32)
+
         return points
 
     def __call__(self, results):
@@ -306,12 +368,19 @@ class LoadPointsFromFile(object):
         points = self._load_points(pts_filename)
         points = points.reshape(-1, self.load_dim)
         points = points[:, self.use_dim]
+        attribute_dims = None
 
         if self.shift_height:
             floor_height = np.percentile(points[:, 2], 0.99)
             height = points[:, 2] - floor_height
             points = np.concatenate([points, np.expand_dims(height, 1)], 1)
+            attribute_dims = dict(height=3)
+
+        points_class = get_points_type(self.coord_type)
+        points = points_class(
+            points, points_dim=points.shape[-1], attribute_dims=attribute_dims)
         results['points'] = points
+
         return results
 
     def __repr__(self):

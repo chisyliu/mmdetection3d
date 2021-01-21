@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from mmcv.cnn import ConvModule
+from mmcv.runner import force_fp32
 from torch import nn as nn
 from torch.nn import functional as F
 
@@ -8,9 +8,10 @@ from mmdet3d.core.post_processing import aligned_3d_nms
 from mmdet3d.models.builder import build_loss
 from mmdet3d.models.losses import chamfer_distance
 from mmdet3d.models.model_utils import VoteModule
-from mmdet3d.ops import PointSAModule, furthest_point_sample
+from mmdet3d.ops import build_sa_module, furthest_point_sample
 from mmdet.core import build_bbox_coder, multi_apply
 from mmdet.models import HEADS
+from .base_conv_bbox_head import BaseConvBboxHead
 
 
 @HEADS.register_module()
@@ -23,10 +24,10 @@ class VoteHead(nn.Module):
             decoding boxes.
         train_cfg (dict): Config for training.
         test_cfg (dict): Config for testing.
-        vote_moudule_cfg (dict): Config of VoteModule for point-wise votes.
+        vote_module_cfg (dict): Config of VoteModule for point-wise votes.
         vote_aggregation_cfg (dict): Config of vote aggregation layer.
-        feat_channels (tuple[int]): Convolution channels of
-            prediction layer.
+        pred_layer_cfg (dict): Config of classfication and regression
+            prediction layers.
         conv_cfg (dict): Config of convolution in prediction layer.
         norm_cfg (dict): Config of BN in prediction layer.
         objectness_loss (dict): Config of objectness loss.
@@ -43,9 +44,9 @@ class VoteHead(nn.Module):
                  bbox_coder,
                  train_cfg=None,
                  test_cfg=None,
-                 vote_moudule_cfg=None,
+                 vote_module_cfg=None,
                  vote_aggregation_cfg=None,
-                 feat_channels=(128, 128),
+                 pred_layer_cfg=None,
                  conv_cfg=dict(type='Conv1d'),
                  norm_cfg=dict(type='BN1d'),
                  objectness_loss=None,
@@ -54,59 +55,75 @@ class VoteHead(nn.Module):
                  dir_res_loss=None,
                  size_class_loss=None,
                  size_res_loss=None,
-                 semantic_loss=None):
+                 semantic_loss=None,
+                 iou_loss=None):
         super(VoteHead, self).__init__()
         self.num_classes = num_classes
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
-        self.gt_per_seed = vote_moudule_cfg['gt_per_seed']
+        self.gt_per_seed = vote_module_cfg['gt_per_seed']
         self.num_proposal = vote_aggregation_cfg['num_point']
 
         self.objectness_loss = build_loss(objectness_loss)
         self.center_loss = build_loss(center_loss)
-        self.dir_class_loss = build_loss(dir_class_loss)
         self.dir_res_loss = build_loss(dir_res_loss)
-        self.size_class_loss = build_loss(size_class_loss)
+        self.dir_class_loss = build_loss(dir_class_loss)
         self.size_res_loss = build_loss(size_res_loss)
-        self.semantic_loss = build_loss(semantic_loss)
-
-        assert vote_aggregation_cfg['mlp_channels'][0] == vote_moudule_cfg[
-            'in_channels']
+        if size_class_loss is not None:
+            self.size_class_loss = build_loss(size_class_loss)
+        if semantic_loss is not None:
+            self.semantic_loss = build_loss(semantic_loss)
+        if iou_loss is not None:
+            self.iou_loss = build_loss(iou_loss)
+        else:
+            self.iou_loss = None
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.num_sizes = self.bbox_coder.num_sizes
         self.num_dir_bins = self.bbox_coder.num_dir_bins
 
-        self.vote_module = VoteModule(**vote_moudule_cfg)
-        self.vote_aggregation = PointSAModule(**vote_aggregation_cfg)
+        self.vote_module = VoteModule(**vote_module_cfg)
+        self.vote_aggregation = build_sa_module(vote_aggregation_cfg)
+        self.fp16_enabled = False
 
-        prev_channel = vote_aggregation_cfg['mlp_channels'][-1]
-        conv_pred_list = list()
-        for k in range(len(feat_channels)):
-            conv_pred_list.append(
-                ConvModule(
-                    prev_channel,
-                    feat_channels[k],
-                    1,
-                    padding=0,
-                    conv_cfg=conv_cfg,
-                    norm_cfg=norm_cfg,
-                    bias=True,
-                    inplace=True))
-            prev_channel = feat_channels[k]
-        self.conv_pred = nn.Sequential(*conv_pred_list)
-
-        # Objectness scores (2), center residual (3),
-        # heading class+residual (num_dir_bins*2),
-        # size class+residual(num_sizes*4)
-        conv_out_channel = (2 + 3 + self.num_dir_bins * 2 +
-                            self.num_sizes * 4 + num_classes)
-        self.conv_pred.add_module('conv_out',
-                                  nn.Conv1d(prev_channel, conv_out_channel, 1))
+        # Bbox classification and regression
+        self.conv_pred = BaseConvBboxHead(
+            **pred_layer_cfg,
+            num_cls_out_channels=self._get_cls_out_channels(),
+            num_reg_out_channels=self._get_reg_out_channels())
 
     def init_weights(self):
         """Initialize weights of VoteHead."""
         pass
+
+    def _get_cls_out_channels(self):
+        """Return the channel number of classification outputs."""
+        # Class numbers (k) + objectness (2)
+        return self.num_classes + 2
+
+    def _get_reg_out_channels(self):
+        """Return the channel number of regression outputs."""
+        # Objectness scores (2), center residual (3),
+        # heading class+residual (num_dir_bins*2),
+        # size class+residual(num_sizes*4)
+        return 3 + self.num_dir_bins * 2 + self.num_sizes * 4
+
+    def _extract_input(self, feat_dict):
+        """Extract inputs from features dictionary.
+
+        Args:
+            feat_dict (dict): Feature dict from backbone.
+
+        Returns:
+            torch.Tensor: Coordinates of input points.
+            torch.Tensor: Features of input points.
+            torch.Tensor: Indices of input points.
+        """
+        seed_points = feat_dict['fp_xyz'][-1]
+        seed_features = feat_dict['fp_features'][-1]
+        seed_indices = feat_dict['fp_indices'][-1]
+
+        return seed_points, seed_features, seed_indices
 
     def forward(self, feat_dict, sample_mod):
         """Forward pass.
@@ -122,59 +139,79 @@ class VoteHead(nn.Module):
         Args:
             feat_dict (dict): Feature dict from backbone.
             sample_mod (str): Sample mode for vote aggregation layer.
-                valid modes are "vote", "seed" and "random".
+                valid modes are "vote", "seed", "random" and "spec".
 
         Returns:
             dict: Predictions of vote head.
         """
-        assert sample_mod in ['vote', 'seed', 'random']
+        assert sample_mod in ['vote', 'seed', 'random', 'spec']
 
-        seed_points = feat_dict['fp_xyz'][-1]
-        seed_features = feat_dict['fp_features'][-1]
-        seed_indices = feat_dict['fp_indices'][-1]
+        seed_points, seed_features, seed_indices = self._extract_input(
+            feat_dict)
 
         # 1. generate vote_points from seed_points
-        vote_points, vote_features = self.vote_module(seed_points,
-                                                      seed_features)
+        vote_points, vote_features, vote_offset = self.vote_module(
+            seed_points, seed_features)
         results = dict(
             seed_points=seed_points,
             seed_indices=seed_indices,
             vote_points=vote_points,
-            vote_features=vote_features)
+            vote_features=vote_features,
+            vote_offset=vote_offset)
 
         # 2. aggregate vote_points
         if sample_mod == 'vote':
             # use fps in vote_aggregation
-            sample_indices = None
+            aggregation_inputs = dict(
+                points_xyz=vote_points, features=vote_features)
         elif sample_mod == 'seed':
             # FPS on seed and choose the votes corresponding to the seeds
             sample_indices = furthest_point_sample(seed_points,
                                                    self.num_proposal)
+            aggregation_inputs = dict(
+                points_xyz=vote_points,
+                features=vote_features,
+                indices=sample_indices)
         elif sample_mod == 'random':
             # Random sampling from the votes
             batch_size, num_seed = seed_points.shape[:2]
             sample_indices = seed_points.new_tensor(
                 torch.randint(0, num_seed, (batch_size, self.num_proposal)),
                 dtype=torch.int32)
+            aggregation_inputs = dict(
+                points_xyz=vote_points,
+                features=vote_features,
+                indices=sample_indices)
+        elif sample_mod == 'spec':
+            # Specify the new center in vote_aggregation
+            aggregation_inputs = dict(
+                points_xyz=seed_points,
+                features=seed_features,
+                target_xyz=vote_points)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                f'Sample mode {sample_mod} is not supported!')
 
-        vote_aggregation_ret = self.vote_aggregation(vote_points,
-                                                     vote_features,
-                                                     sample_indices)
+        vote_aggregation_ret = self.vote_aggregation(**aggregation_inputs)
         aggregated_points, features, aggregated_indices = vote_aggregation_ret
+
         results['aggregated_points'] = aggregated_points
+        results['aggregated_features'] = features
         results['aggregated_indices'] = aggregated_indices
 
         # 3. predict bbox and score
-        predictions = self.conv_pred(features)
+        cls_predictions, reg_predictions = self.conv_pred(features)
 
         # 4. decode predictions
-        decode_res = self.bbox_coder.split_pred(predictions, aggregated_points)
+        decode_res = self.bbox_coder.split_pred(cls_predictions,
+                                                reg_predictions,
+                                                aggregated_points)
+
         results.update(decode_res)
 
         return results
 
+    @force_fp32(apply_to=('bbox_preds', ))
     def loss(self,
              bbox_preds,
              points,
@@ -183,7 +220,8 @@ class VoteHead(nn.Module):
              pts_semantic_mask=None,
              pts_instance_mask=None,
              img_metas=None,
-             gt_bboxes_ignore=None):
+             gt_bboxes_ignore=None,
+             ret_target=False):
         """Compute loss.
 
         Args:
@@ -199,6 +237,7 @@ class VoteHead(nn.Module):
             img_metas (list[dict]): Contain pcd and img's meta info.
             gt_bboxes_ignore (None | list[torch.Tensor]): Specify
                 which bounding.
+            ret_target (Bool): Return targets or not.
 
         Returns:
             dict: Losses of Votenet.
@@ -207,9 +246,10 @@ class VoteHead(nn.Module):
                                    pts_semantic_mask, pts_instance_mask,
                                    bbox_preds)
         (vote_targets, vote_target_masks, size_class_targets, size_res_targets,
-         dir_class_targets, dir_res_targets, center_targets, mask_targets,
-         valid_gt_masks, objectness_targets, objectness_weights,
-         box_loss_weights, valid_gt_weights) = targets
+         dir_class_targets, dir_res_targets, center_targets,
+         assigned_center_targets, mask_targets, valid_gt_masks,
+         objectness_targets, objectness_weights, box_loss_weights,
+         valid_gt_weights) = targets
 
         # calculate vote loss
         vote_loss = self.vote_module.get_loss(bbox_preds['seed_points'],
@@ -258,7 +298,7 @@ class VoteHead(nn.Module):
             (batch_size, proposal_num, self.num_sizes))
         one_hot_size_targets.scatter_(2, size_class_targets.unsqueeze(-1), 1)
         one_hot_size_targets_expand = one_hot_size_targets.unsqueeze(
-            -1).repeat(1, 1, 1, 3)
+            -1).repeat(1, 1, 1, 3).contiguous()
         size_residual_norm = torch.sum(
             bbox_preds['size_res_norm'] * one_hot_size_targets_expand, 2)
         box_loss_weights_expand = box_loss_weights.unsqueeze(-1).repeat(
@@ -283,6 +323,21 @@ class VoteHead(nn.Module):
             dir_res_loss=dir_res_loss,
             size_class_loss=size_class_loss,
             size_res_loss=size_res_loss)
+
+        if self.iou_loss:
+            corners_pred = self.bbox_coder.decode_corners(
+                bbox_preds['center'], size_residual_norm,
+                one_hot_size_targets_expand)
+            corners_target = self.bbox_coder.decode_corners(
+                assigned_center_targets, size_res_targets,
+                one_hot_size_targets_expand)
+            iou_loss = self.iou_loss(
+                corners_pred, corners_target, weight=box_loss_weights)
+            losses['iou_loss'] = iou_loss
+
+        if ret_target:
+            losses['targets'] = targets
+
         return losses
 
     def get_targets(self,
@@ -335,10 +390,12 @@ class VoteHead(nn.Module):
         ]
 
         (vote_targets, vote_target_masks, size_class_targets, size_res_targets,
-         dir_class_targets, dir_res_targets, center_targets, mask_targets,
-         objectness_targets, objectness_masks) = multi_apply(
-             self.get_targets_single, points, gt_bboxes_3d, gt_labels_3d,
-             pts_semantic_mask, pts_instance_mask, aggregated_points)
+         dir_class_targets, dir_res_targets, center_targets,
+         assigned_center_targets, mask_targets, objectness_targets,
+         objectness_masks) = multi_apply(self.get_targets_single, points,
+                                         gt_bboxes_3d, gt_labels_3d,
+                                         pts_semantic_mask, pts_instance_mask,
+                                         aggregated_points)
 
         # pad targets as original code of votenet.
         for index in range(len(gt_labels_3d)):
@@ -352,6 +409,7 @@ class VoteHead(nn.Module):
         center_targets = torch.stack(center_targets)
         valid_gt_masks = torch.stack(valid_gt_masks)
 
+        assigned_center_targets = torch.stack(assigned_center_targets)
         objectness_targets = torch.stack(objectness_targets)
         objectness_weights = torch.stack(objectness_masks)
         objectness_weights /= (torch.sum(objectness_weights) + 1e-6)
@@ -367,9 +425,9 @@ class VoteHead(nn.Module):
 
         return (vote_targets, vote_target_masks, size_class_targets,
                 size_res_targets, dir_class_targets, dir_res_targets,
-                center_targets, mask_targets, valid_gt_masks,
-                objectness_targets, objectness_weights, box_loss_weights,
-                valid_gt_weights)
+                center_targets, assigned_center_targets, mask_targets,
+                valid_gt_masks, objectness_targets, objectness_weights,
+                box_loss_weights, valid_gt_weights)
 
     def get_targets_single(self,
                            points,
@@ -409,7 +467,8 @@ class VoteHead(nn.Module):
             box_indices_all = gt_bboxes_3d.points_in_boxes(points)
             for i in range(gt_labels_3d.shape[0]):
                 box_indices = box_indices_all[:, i]
-                indices = torch.nonzero(box_indices).squeeze(-1)
+                indices = torch.nonzero(
+                    box_indices, as_tuple=False).squeeze(-1)
                 selected_points = points[indices]
                 vote_target_masks[indices] = 1
                 vote_targets_tmp = vote_targets[indices]
@@ -418,7 +477,8 @@ class VoteHead(nn.Module):
 
                 for j in range(self.gt_per_seed):
                     column_indices = torch.nonzero(
-                        vote_target_idx[indices] == j).squeeze(-1)
+                        vote_target_idx[indices] == j,
+                        as_tuple=False).squeeze(-1)
                     vote_targets_tmp[column_indices,
                                      int(j * 3):int(j * 3 +
                                                     3)] = votes[column_indices]
@@ -435,7 +495,8 @@ class VoteHead(nn.Module):
                                                  dtype=torch.long)
 
             for i in torch.unique(pts_instance_mask):
-                indices = torch.nonzero(pts_instance_mask == i).squeeze(-1)
+                indices = torch.nonzero(
+                    pts_instance_mask == i, as_tuple=False).squeeze(-1)
                 if pts_semantic_mask[indices[0]] < self.num_classes:
                     selected_points = points[indices, :3]
                     center = 0.5 * (
@@ -485,13 +546,19 @@ class VoteHead(nn.Module):
         size_res_targets /= pos_mean_sizes
 
         mask_targets = gt_labels_3d[assignment]
+        assigned_center_targets = center_targets[assignment]
 
         return (vote_targets, vote_target_masks, size_class_targets,
-                size_res_targets,
-                dir_class_targets, dir_res_targets, center_targets,
+                size_res_targets, dir_class_targets,
+                dir_res_targets, center_targets, assigned_center_targets,
                 mask_targets.long(), objectness_targets, objectness_masks)
 
-    def get_bboxes(self, points, bbox_preds, input_metas, rescale=False):
+    def get_bboxes(self,
+                   points,
+                   bbox_preds,
+                   input_metas,
+                   rescale=False,
+                   use_nms=True):
         """Generate bboxes from vote head predictions.
 
         Args:
@@ -499,6 +566,8 @@ class VoteHead(nn.Module):
             bbox_preds (dict): Predictions from vote head.
             input_metas (list[dict]): Point cloud and image's meta info.
             rescale (bool): Whether to rescale bboxes.
+            use_nms (bool): Whether to apply NMS, skip nms postprocessing
+                while using vote head in rpn stage.
 
         Returns:
             list[tuple[torch.Tensor]]: Bounding boxes, scores and labels.
@@ -508,19 +577,23 @@ class VoteHead(nn.Module):
         sem_scores = F.softmax(bbox_preds['sem_scores'], dim=-1)
         bbox3d = self.bbox_coder.decode(bbox_preds)
 
-        batch_size = bbox3d.shape[0]
-        results = list()
-        for b in range(batch_size):
-            bbox_selected, score_selected, labels = self.multiclass_nms_single(
-                obj_scores[b], sem_scores[b], bbox3d[b], points[b, ..., :3],
-                input_metas[b])
-            bbox = input_metas[b]['box_type_3d'](
-                bbox_selected,
-                box_dim=bbox_selected.shape[-1],
-                with_yaw=self.bbox_coder.with_rot)
-            results.append((bbox, score_selected, labels))
+        if use_nms:
+            batch_size = bbox3d.shape[0]
+            results = list()
+            for b in range(batch_size):
+                bbox_selected, score_selected, labels = \
+                    self.multiclass_nms_single(obj_scores[b], sem_scores[b],
+                                               bbox3d[b], points[b, ..., :3],
+                                               input_metas[b])
+                bbox = input_metas[b]['box_type_3d'](
+                    bbox_selected,
+                    box_dim=bbox_selected.shape[-1],
+                    with_yaw=self.bbox_coder.with_rot)
+                results.append((bbox, score_selected, labels))
 
-        return results
+            return results
+        else:
+            return bbox3d
 
     def multiclass_nms_single(self, obj_scores, sem_scores, bbox, points,
                               input_meta):
@@ -558,7 +631,8 @@ class VoteHead(nn.Module):
 
         # filter empty boxes and boxes with low score
         scores_mask = (obj_scores > self.test_cfg.score_thr)
-        nonempty_box_inds = torch.nonzero(nonempty_box_mask).flatten()
+        nonempty_box_inds = torch.nonzero(
+            nonempty_box_mask, as_tuple=False).flatten()
         nonempty_mask = torch.zeros_like(bbox_classes).scatter(
             0, nonempty_box_inds[nms_selected], 1)
         selected = (nonempty_mask.bool() & scores_mask.bool())

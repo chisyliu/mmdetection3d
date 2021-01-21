@@ -65,10 +65,9 @@ def _get_detector_cfg(fname):
     train_cfg = mmcv.Config(copy.deepcopy(config.train_cfg))
     test_cfg = mmcv.Config(copy.deepcopy(config.test_cfg))
 
-    vote_net = model
-    vote_net.update(train_cfg=train_cfg)
-    vote_net.update(test_cfg=test_cfg)
-    return vote_net
+    model.update(train_cfg=train_cfg)
+    model.update(test_cfg=test_cfg)
+    return model
 
 
 def test_get_dynamic_voxelnet():
@@ -114,9 +113,9 @@ def test_voxel_net():
 
     # test simple_test
     results = self.simple_test(points, img_metas)
-    boxes_3d = results['boxes_3d']
-    scores_3d = results['scores_3d']
-    labels_3d = results['labels_3d']
+    boxes_3d = results[0]['boxes_3d']
+    scores_3d = results[0]['scores_3d']
+    labels_3d = results[0]['labels_3d']
     assert boxes_3d.tensor.shape == (50, 7)
     assert scores_3d.shape == torch.Size([50])
     assert labels_3d.shape == torch.Size([50])
@@ -156,9 +155,9 @@ def test_vote_net():
 
     # test simple_test
     results = self.simple_test(points, img_metas)
-    boxes_3d = results['boxes_3d']
-    scores_3d = results['scores_3d']
-    labels_3d = results['labels_3d']
+    boxes_3d = results[0]['boxes_3d']
+    scores_3d = results[0]['scores_3d']
+    labels_3d = results[0]['labels_3d']
     assert boxes_3d.tensor.shape[0] >= 0
     assert boxes_3d.tensor.shape[1] == 7
     assert scores_3d.shape[0] >= 0
@@ -172,8 +171,8 @@ def test_parta2():
     parta2 = _get_detector_cfg(
         'parta2/hv_PartA2_secfpn_2x8_cyclic_80e_kitti-3d-3class.py')
     self = build_detector(parta2).cuda()
-    points_0 = torch.rand([2000, 4], device='cuda')
-    points_1 = torch.rand([2000, 4], device='cuda')
+    points_0 = torch.rand([1000, 4], device='cuda')
+    points_1 = torch.rand([1000, 4], device='cuda')
     points = [points_0, points_1]
     img_meta_0 = dict(box_type_3d=LiDARInstance3DBoxes)
     img_meta_1 = dict(box_type_3d=LiDARInstance3DBoxes)
@@ -198,10 +197,82 @@ def test_parta2():
 
     # test_simple_test
     results = self.simple_test(points, img_metas)
-    boxes_3d = results['boxes_3d']
-    scores_3d = results['scores_3d']
-    labels_3d = results['labels_3d']
+    boxes_3d = results[0]['boxes_3d']
+    scores_3d = results[0]['scores_3d']
+    labels_3d = results[0]['labels_3d']
     assert boxes_3d.tensor.shape[0] >= 0
     assert boxes_3d.tensor.shape[1] == 7
     assert scores_3d.shape[0] >= 0
     assert labels_3d.shape[0] >= 0
+
+
+def test_centerpoint():
+    if not torch.cuda.is_available():
+        pytest.skip('test requires GPU and torch+cuda')
+    centerpoint = _get_detector_cfg(
+        'centerpoint/centerpoint_0075voxel_second_secfpn_'
+        'dcn_4x8_cyclic_flip-tta_20e_nus.py')
+    self = build_detector(centerpoint).cuda()
+    points_0 = torch.rand([1000, 5], device='cuda')
+    points_1 = torch.rand([1000, 5], device='cuda')
+    points = [points_0, points_1]
+    img_meta_0 = dict(
+        box_type_3d=LiDARInstance3DBoxes,
+        flip=True,
+        pcd_horizontal_flip=True,
+        pcd_vertical_flip=False)
+    img_meta_1 = dict(
+        box_type_3d=LiDARInstance3DBoxes,
+        flip=True,
+        pcd_horizontal_flip=False,
+        pcd_vertical_flip=True)
+    img_metas = [img_meta_0, img_meta_1]
+    gt_bbox_0 = LiDARInstance3DBoxes(
+        torch.rand([10, 9], device='cuda'), box_dim=9)
+    gt_bbox_1 = LiDARInstance3DBoxes(
+        torch.rand([10, 9], device='cuda'), box_dim=9)
+    gt_bboxes = [gt_bbox_0, gt_bbox_1]
+    gt_labels_0 = torch.randint(0, 3, [10], device='cuda')
+    gt_labels_1 = torch.randint(0, 3, [10], device='cuda')
+    gt_labels = [gt_labels_0, gt_labels_1]
+
+    # test_forward_train
+    losses = self.forward_train(points, img_metas, gt_bboxes, gt_labels)
+    for key, value in losses.items():
+        assert value >= 0
+
+    # test_simple_test
+    results = self.simple_test(points, img_metas)
+    boxes_3d_0 = results[0]['pts_bbox']['boxes_3d']
+    scores_3d_0 = results[0]['pts_bbox']['scores_3d']
+    labels_3d_0 = results[0]['pts_bbox']['labels_3d']
+    assert boxes_3d_0.tensor.shape[0] >= 0
+    assert boxes_3d_0.tensor.shape[1] == 9
+    assert scores_3d_0.shape[0] >= 0
+    assert labels_3d_0.shape[0] >= 0
+    boxes_3d_1 = results[1]['pts_bbox']['boxes_3d']
+    scores_3d_1 = results[1]['pts_bbox']['scores_3d']
+    labels_3d_1 = results[1]['pts_bbox']['labels_3d']
+    assert boxes_3d_1.tensor.shape[0] >= 0
+    assert boxes_3d_1.tensor.shape[1] == 9
+    assert scores_3d_1.shape[0] >= 0
+    assert labels_3d_1.shape[0] >= 0
+
+    # test_aug_test
+    points = [[torch.rand([1000, 5], device='cuda')]]
+    img_metas = [[
+        dict(
+            box_type_3d=LiDARInstance3DBoxes,
+            pcd_scale_factor=1.0,
+            flip=True,
+            pcd_horizontal_flip=True,
+            pcd_vertical_flip=False)
+    ]]
+    results = self.aug_test(points, img_metas)
+    boxes_3d_0 = results[0]['pts_bbox']['boxes_3d']
+    scores_3d_0 = results[0]['pts_bbox']['scores_3d']
+    labels_3d_0 = results[0]['pts_bbox']['labels_3d']
+    assert boxes_3d_0.tensor.shape[0] >= 0
+    assert boxes_3d_0.tensor.shape[1] == 9
+    assert scores_3d_0.shape[0] >= 0
+    assert labels_3d_0.shape[0] >= 0

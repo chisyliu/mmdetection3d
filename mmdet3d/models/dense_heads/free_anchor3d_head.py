@@ -1,4 +1,5 @@
 import torch
+from mmcv.runner import force_fp32
 from torch.nn import functional as F
 
 from mmdet3d.core.bbox import bbox_overlaps_nearest_3d
@@ -38,6 +39,7 @@ class FreeAnchor3DHead(Anchor3DHead):
         self.gamma = gamma
         self.alpha = alpha
 
+    @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'dir_cls_preds'))
     def loss(self,
              cls_scores,
              bbox_preds,
@@ -140,7 +142,7 @@ class FreeAnchor3DHead(Anchor3DHead):
                 box_cls_prob = torch.sparse.sum(
                     object_cls_box_prob, dim=0).to_dense()
 
-                indices = torch.nonzero(box_cls_prob).t_()
+                indices = torch.nonzero(box_cls_prob, as_tuple=False).t_()
                 if indices.numel() == 0:
                     image_box_prob = torch.zeros(
                         anchors_.size(0),

@@ -76,8 +76,9 @@ def inference_detector(model, pcd):
         # scatter to specified GPU
         data = scatter(data, [device.index])[0]
     else:
-        raise NotImplementedError('Not support cpu-only currently')
-
+        # this is a workaround to avoid the bug of MMDataParallel
+        data['img_metas'] = data['img_metas'][0].data
+        data['points'] = data['points'][0].data
     # forward the model
     with torch.no_grad():
         result = model(return_loss=False, rescale=True, **data)
@@ -98,7 +99,7 @@ def show_result_meshlab(data, result, out_dir):
 
     assert out_dir is not None, 'Expect out_dir, got none.'
 
-    pred_bboxes = result['boxes_3d'].tensor.numpy()
+    pred_bboxes = result[0]['boxes_3d'].tensor.numpy()
     # for now we convert points into depth mode
     if data['img_metas'][0][0]['box_mode_3d'] != Box3DMode.DEPTH:
         points = points[..., [1, 0, 2]]

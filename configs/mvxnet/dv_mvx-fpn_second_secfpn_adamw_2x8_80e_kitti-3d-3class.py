@@ -135,7 +135,7 @@ img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 input_modality = dict(use_lidar=True, use_camera=True)
 train_pipeline = [
-    dict(type='LoadPointsFromFile', load_dim=4, use_dim=4),
+    dict(type='LoadPointsFromFile', coord_type='LIDAR', load_dim=4, use_dim=4),
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
@@ -160,7 +160,7 @@ train_pipeline = [
         keys=['points', 'img', 'gt_bboxes_3d', 'gt_labels_3d']),
 ]
 test_pipeline = [
-    dict(type='LoadPointsFromFile', load_dim=4, use_dim=4),
+    dict(type='LoadPointsFromFile', coord_type='LIDAR', load_dim=4, use_dim=4),
     dict(type='LoadImageFromFile'),
     dict(
         type='MultiScaleFlipAug3D',
@@ -228,7 +228,7 @@ optimizer = dict(type='AdamW', lr=0.003, betas=(0.95, 0.99), weight_decay=0.01)
 # max_norm=10 is better for SECOND
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
-    policy='CosineAnealing',
+    policy='CosineAnnealing',
     warmup='linear',
     warmup_iters=1000,
     warmup_ratio=1.0 / 10,
@@ -249,6 +249,7 @@ total_epochs = 40
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from = './pretrain_mmdet/mvx_faster_rcnn_detectron2-caffe_20e_coco-pretrain_gt-sample_kitti-3-class_moderate-79.3_20200207-a4a6a3c7.pth'  # noqa
+# You may need to download the model first is the network is unstable
+load_from = 'https://download.openmmlab.com/mmdetection3d/pretrain_models/mvx_faster_rcnn_detectron2-caffe_20e_coco-pretrain_gt-sample_kitti-3-class_moderate-79.3_20200207-a4a6a3c7.pth'  # noqa
 resume_from = None
 workflow = [('train', 1)]
